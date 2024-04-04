@@ -2,6 +2,12 @@
 
 A server that receives messages on a topic, buffers the messages and sends them to an client requesting the messages of the specified topic.
 
+## Run the Server
+
+```shell
+go run .
+```
+
 ## Send Message
 Send a message to a topic '/example'
 
