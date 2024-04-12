@@ -26,14 +26,11 @@ func NewTopic() (topic *Topic){
 
 func (t *Topic) broadcastMessage(msg []byte){
     fmt.Println("broadcastMessage")
-    
-
     for w,_ := range t.subscribers{
         flusher, ok := (*w).(http.Flusher)
         if !ok {
             panic("expected http.ResponseWriter to be an http.Flusher")
         }
-        fmt.Printf("%s", msg)
         (*w).Write(msg)
         (*w).Write([]byte("\n"))
         flusher.Flush()
@@ -57,9 +54,9 @@ func (t *Topic) removeSubscriber(w *http.ResponseWriter){
     t.lock.Unlock()
 }
 
-func (t Topic) Print(){
-    fmt.Printf("%d subscribers\n", len(t.subscribers))
-}
+//func (t Topic) Print(){
+//    fmt.Printf("%d subscribers\n", len(t.subscribers))
+//}
 
 
 func PrintHeader(req *http.Request){
@@ -79,10 +76,11 @@ type Server struct{
 }
 
 func (s Server)PrintQueue(){
-    fmt.Printf("len(queue) = %d\n", len(s.queue))
+    fmt.Printf("[%d] ", len(s.queue))
     for k, t := range s.queue { 
-        fmt.Printf("%v -> %d\n", k, len(t.subscribers))
+        fmt.Printf("%v -> %d,\t" , k, len(t.subscribers))
     }
+    fmt.Println()
 }
 
 //Subscriber
@@ -107,19 +105,21 @@ func (s *Server) handleGet(w http.ResponseWriter, req *http.Request){
     }
 
     topic.addSubscriber(&w)
+    s.PrintQueue()
     notify := w.(http.CloseNotifier).CloseNotify()
     
     select{
     case <- notify:
         fmt.Println("Notify")
-        return
     case <- req.Context().Done():
         fmt.Println("Context.Done")
-        return
     }
     
     topic.removeSubscriber(&w)
-    //queue[req.URL.String()] = topic
+
+    if len(topic.subscribers) <= 0 {
+        delete(s.queue, req.URL.String())
+    }
 }
 
 
