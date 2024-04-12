@@ -7,50 +7,60 @@ import (
     "flag"
     "io"
     "strings"
+    "sync"
 )
 
-type void struct{}
 
 type Topic struct {
-    messages [][]byte
-    subscribers map[chan []byte]void
+    lock sync.Mutex
+    subscribers map[*http.ResponseWriter]struct{} // maps from subscriber to its current pos in the queue
 }
 
-func (t *Topic) addMessage(msg []byte){
-    fmt.Println("addMessage")
-    t.messages = append(t.messages, msg)
+
+func NewTopic() (topic *Topic){
+    topic = new(Topic)
+    //topic.messageQueue = make([][]bytes)
+    topic.subscribers = make(map[*http.ResponseWriter]struct{})
+    return
 }
 
-func (t *Topic) addSubscriber(c chan []byte){
+func (t *Topic) broadcastMessage(msg []byte){
+    fmt.Println("broadcastMessage")
+    
+
+    for w,_ := range t.subscribers{
+        flusher, ok := (*w).(http.Flusher)
+        if !ok {
+            panic("expected http.ResponseWriter to be an http.Flusher")
+        }
+        fmt.Printf("%s", msg)
+        (*w).Write(msg)
+        (*w).Write([]byte("\n"))
+        flusher.Flush()
+    }
+}
+
+func (t *Topic) addSubscriber(w *http.ResponseWriter){
     fmt.Println("addSub")
-    _, ok := t.subscribers[c]
-    if !ok{
-        t.subscribers[c] = void{}
-    }
-    fmt.Println("END addSub")
+    t.lock.Lock()
+    t.subscribers[w] = struct{}{}
+    t.lock.Unlock()
 }
 
-func (t *Topic) removeSubscriber(c chan []byte){
+func (t *Topic) removeSubscriber(w *http.ResponseWriter){
     fmt.Println("removeSub")
-    _, ok := t.subscribers[c]
+    t.lock.Lock()
+    _, ok := t.subscribers[w]
     if ok{
-        delete(t.subscribers, c)
+        delete(t.subscribers, w)
     }
+    t.lock.Unlock()
 }
 
 func (t Topic) Print(){
-    fmt.Printf("|subs| = %d\t|msgs| = % d\n", len(t.subscribers), len(t.messages))
+    fmt.Printf("%d subscribers\n", len(t.subscribers))
 }
 
-//type Queue []Topic
-
-
-func PrintQueue(queue map[string]*Topic){
-    fmt.Printf("len(queue) = %d\n", len(queue))
-    for k, v := range queue { 
-        fmt.Printf("\t%v -> %v\n", k, v)
-    }
-}
 
 func PrintHeader(req *http.Request){
     var b strings.Builder
@@ -64,100 +74,70 @@ func PrintHeader(req *http.Request){
     log.Println(b.String())
 }
 
+type Server struct{
+    queue map[string]*Topic
+}
+
+func (s Server)PrintQueue(){
+    fmt.Printf("len(queue) = %d\n", len(s.queue))
+    for k, t := range s.queue { 
+        fmt.Printf("%v -> %d\n", k, len(t.subscribers))
+    }
+}
 
 //Subscriber
-func handleGet(w http.ResponseWriter, req *http.Request, queue map[string]*Topic){
+func (s *Server) handleGet(w http.ResponseWriter, req *http.Request){
     w.Header().Set("Content-Type", "text/event-stream")
     w.Header().Set("Cache-Control", "no-cache")
     w.Header().Set("Connection", "keep-alive")
+
+    w.WriteHeader(http.StatusOK)
 
     flusher, ok := w.(http.Flusher)
     if !ok {
         panic("expected http.ResponseWriter to be an http.Flusher")
     }
-
-    topic, ok := queue[req.URL.String()]
-
-    if !ok {
-        return
-    }
-
-    for i := 0; i < len(topic.messages); i++ {
-        //w.Write(topic.messages[i])
-        fmt.Fprintf(w, "%s\n", topic.messages[i])
-    }
-
     flusher.Flush()
 
-    done := make(chan bool)
-    push := make(chan []byte)
+    topic, ok := s.queue[req.URL.String()]
 
-    topic.addSubscriber(push)
-    queue[req.URL.String()] = topic
+    if !ok {
+        topic = NewTopic()
+        s.queue[req.URL.String()] = topic
+    }
 
-    //https://stackoverflow.com/questions/51945810/how-to-non-destructively-check-if-an-http-client-has-shut-down-the-connection
-    //http://technosophos.com/2013/12/11/go-get-notified-when-an-http-request-closes.html
-
+    topic.addSubscriber(&w)
     notify := w.(http.CloseNotifier).CloseNotify()
-
-    go func(){
-        for {
-            select{
-            case msg := <- push:
-                //fmt.Println("New Message")
-                _, ok := w.Write(msg)
-                if ok != nil {
-                    done <- false
-                    return
-                }
-                _, ok = w.Write([]byte("\n"))
-                if ok != nil {
-                    done <- false
-                    return
-                }
-                flusher.Flush()
-                //fmt.Println("New Message Flush")
-            case <- notify:
-                fmt.Println("Notify")
-                done <- false
-                return
-            case <- req.Context().Done():
-                fmt.Println("Context.Done")
-                done <- false
-                return
-            }
-        }
-    }()
-    <- done
-    topic.removeSubscriber(push)
-    queue[req.URL.String()] = topic
+    
+    select{
+    case <- notify:
+        fmt.Println("Notify")
+        return
+    case <- req.Context().Done():
+        fmt.Println("Context.Done")
+        return
+    }
+    
+    topic.removeSubscriber(&w)
+    //queue[req.URL.String()] = topic
 }
 
 
 //Publisher
-func handlePost(w http.ResponseWriter, req *http.Request, queue map[string]*Topic){
+func (s *Server)handlePost(w http.ResponseWriter, req *http.Request){
     body, err := io.ReadAll(req.Body)
 
     if err != nil {
         log.Fatalln(err)
     }
 
-    topic, ok := queue[req.URL.String()]
+    topic, ok := s.queue[req.URL.String()]
     if !ok {
-        topic = &Topic{subscribers:make(map[chan []byte]void)}
+        topic = NewTopic()
     }
     
-    topic.Print()
-    topic.addMessage(body)
-    topic.Print()
-    queue[req.URL.String()] = topic
-    PrintQueue(queue)
-    
-
-    //for i := 0; i < len(topic.subscribers); i++ {
-    for sub, _ := range topic.subscribers{
-        sub <- body
-    }
+    topic.broadcastMessage(body)
+    //s.queue[req.URL.String()] = topic
 }
 
 func main() {
@@ -165,23 +145,21 @@ func main() {
     //toAddr := flag.String("to", "127.0.0.1:8080", "the address this proxy will forward to")
     flag.Parse()
 
-    queue := make(map[string]*Topic)
+    server := Server{make(map[string]*Topic)}
 
     http.HandleFunc("/",
         func(w http.ResponseWriter, req *http.Request) {
-            //PrintQueue(queue)
             switch req.Method {
             case "GET":
-                handleGet(w, req, queue)
+                server.handleGet(w, req)
 
             case "POST":
-                handlePost(w, req, queue)
+                server.handlePost(w, req)
             }
-            //PrintQueue(queue)
             fmt.Println()
+            server.PrintQueue()
         })
 
-    //addr := ":8080"
     log.Println("Starting server on", *addr)
     if err := http.ListenAndServe(*addr, nil); err != nil {
         log.Fatal("ListenAndServe:", err)
