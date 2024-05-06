@@ -25,7 +25,7 @@ func NewTopic() (topic *Topic){
 
 
 func (t *Topic) broadcastMessage(msg []byte){
-    fmt.Println("broadcastMessage")
+    //fmt.Println("broadcastMessage")
     t.lock.RLock()
     for w, l := range t.subscribers {
         go func(w *http.ResponseWriter, l *sync.Mutex){
@@ -78,31 +78,67 @@ func PrintHeader(req *http.Request){
     log.Println(b.String())
 }
 
+
 type Server struct{
     queue map[string]*Topic
     lock sync.RWMutex
+    mux *http.ServeMux
 }
 
 func NewServer() (server *Server){
     server = new(Server)
-
+    server.mux = http.NewServeMux()
     server.queue = make(map[string]*Topic)
+    server.routes()
     return
 }
 
-func (s Server)PrintQueue(){
+
+func Info(h http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, req *http.Request){
+        clientIp := req.Header.Get("X-FORWARDED-FOR")
+	    
+        fmt.Printf("+ (%v) (%v) [%s] %s\n", clientIp, req.RemoteAddr, req.Method, req.URL.String())
+        h(w, req)
+        //fmt.Printf("- [%s] %s\n", req.Method, req.URL.String())
+    }
+}
+
+
+func (server *Server) routes(){
+    server.mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request){
+        switch req.Method {
+        case "GET":
+            //server.handlePost(w, req)
+            Info(server.handleGet)(w, req)
+        case "POST":
+            Info(server.handlePost)(w, req)
+        }
+        fmt.Println()
+        server.PrintQueue()
+    })
+    //s.mux.HandleFunc("POST /one", s.handlePost)
+    //s.mux.HandleFunc("GET /one", s.handleGet)
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request){
+    s.mux.ServeHTTP(w, req)
+}
+
+func (s *Server)PrintQueue(){
     s.lock.RLock()
     defer s.lock.RUnlock()
 
     fmt.Printf("[%d] ", len(s.queue))
     for k, t := range s.queue { 
-        fmt.Printf("%v -> %d,\t" , k, len(t.subscribers))
+        fmt.Printf("[%d]%s", len(t.subscribers), k)
     }
-    fmt.Println()
+    //fmt.Println()
 }
 
 //Subscriber
 func (s *Server) handleGet(w http.ResponseWriter, req *http.Request){
+    //fmt.Println("HandleGet")
     w.Header().Set("Content-Type", "text/event-stream")
     w.Header().Set("Cache-Control", "no-cache")
     w.Header().Set("Connection", "keep-alive")
@@ -115,14 +151,17 @@ func (s *Server) handleGet(w http.ResponseWriter, req *http.Request){
     }
     flusher.Flush()
 
+    name := req.URL.String()
+    //name :=  req.PathValue("topic")
+
     s.lock.RLock()
-    topic, ok := s.queue[req.URL.String()]
+    topic, ok := s.queue[name]
     s.lock.RUnlock()
 
     if !ok {
         topic = NewTopic()
         s.lock.Lock()
-        s.queue[req.URL.String()] = topic
+        s.queue[name] = topic
         s.lock.Unlock()
     }
 
@@ -142,7 +181,7 @@ func (s *Server) handleGet(w http.ResponseWriter, req *http.Request){
     topic.lock.RLock()
     if len(topic.subscribers) <= 0 {
         s.lock.Lock()
-        delete(s.queue, req.URL.String())
+        delete(s.queue, name)
         s.lock.Unlock()
     }
     topic.lock.RUnlock()
@@ -151,20 +190,23 @@ func (s *Server) handleGet(w http.ResponseWriter, req *http.Request){
 
 //Publisher
 func (s *Server)handlePost(w http.ResponseWriter, req *http.Request){
+    //fmt.Println("HandlePost")
     body, err := io.ReadAll(req.Body)
 
     if err != nil {
         log.Fatalln(err)
     }
+    name := req.URL.String()
+    //name :=  req.PathValue("topic")
 
     s.lock.RLock()
-    topic, ok := s.queue[req.URL.String()]
+    topic, ok := s.queue[name]
     s.lock.RUnlock()
 
     if !ok {
         topic = NewTopic()
         s.lock.Lock()
-        s.queue[req.URL.String()] = topic
+        s.queue[name] = topic
         s.lock.Unlock()
     }
     
@@ -173,26 +215,12 @@ func (s *Server)handlePost(w http.ResponseWriter, req *http.Request){
 
 func main() {
     addr := flag.String("addr", "127.0.0.1:8080", "proxy's listening address")
-    //toAddr := flag.String("to", "127.0.0.1:8080", "the address this proxy will forward to")
     flag.Parse()
 
-    server := NewServer() //Server{make(map[string]*Topic), sync.RWMutex()}
-
-    http.HandleFunc("/",
-        func(w http.ResponseWriter, req *http.Request) {
-            switch req.Method {
-            case "GET":
-                server.handleGet(w, req)
-
-            case "POST":
-                server.handlePost(w, req)
-            }
-            fmt.Println()
-            server.PrintQueue()
-        })
+    server := NewServer()
 
     log.Println("Starting server on", *addr)
-    if err := http.ListenAndServe(*addr, nil); err != nil {
+    if err := http.ListenAndServe(*addr, server); err != nil {
         log.Fatal("ListenAndServe:", err)
     }
 }
